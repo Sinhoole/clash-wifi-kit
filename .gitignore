@@ -1,0 +1,27 @@
+# 构建产物
+dist/
+build/
+_libs/
+_wheels/
+_pip/
+_tmp/
+_pkg/
+_stage/
+*.spec
+
+# 运行期生成
+*.log
+clash-wifi-history.json
+clash-wifi-gui.json
+clash-wifi-selftest.txt
+clash-watchdog-autostart.cmd
+*.bak
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
