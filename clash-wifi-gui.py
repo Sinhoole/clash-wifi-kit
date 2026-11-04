@@ -39,7 +39,7 @@ except Exception:
 
 # ------------------------------------------------------------------ 常量
 APP_NAME = "Clash WiFi Kit"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 SITE_URL = "https://blog.taoxi.ink"
 SITE_NAME = "Ta0X1 の Blog"
 KEY = "interface-name"
@@ -768,6 +768,201 @@ def set_metrics(eth_name, eth_m, wifi_name, wifi_m, log):
     return olds
 
 
+# ================================================================== 订阅加固
+# 订阅更新是 Clash 客户端唯一会绕过代理、直连上游的路径。若更新时走默认路由，
+# 域名解析与 TLS SNI 就会出现在物理出口上。以下函数负责识别并消除该路径。
+
+
+def profiles_path():
+    cfg = find_config_dir()
+    if not cfg:
+        return None
+    p = os.path.join(cfg, "profiles.yaml")
+    return p if os.path.isfile(p) else None
+
+
+def parse_profiles(path):
+    """行级解析 profiles.yaml，避免引入 YAML 依赖。"""
+    cur, items, in_opt = None, [], False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not items and re.match(r"^current:\s*\S+", line):
+                    cur = re.match(r"^current:\s*(\S+)", line).group(1)
+                    continue
+                m = re.match(r"^- uid:\s*(\S+)", line)
+                if m:
+                    items.append({"uid": m.group(1), "option": {}, "selected": 0})
+                    in_opt = False
+                    continue
+                if not items:
+                    continue
+                it = items[-1]
+                if re.match(r"^  option:\s*$", line):
+                    in_opt = True
+                    continue
+                if in_opt and line.startswith("    ") and not line.startswith("  - "):
+                    m = re.match(r"^    (\w+):\s*(.*)$", line)
+                    if m:
+                        it["option"][m.group(1)] = m.group(2).strip()
+                    continue
+                if line.startswith("  - name:"):
+                    it["selected"] += 1
+                    continue
+                m = re.match(r"^  (\w+):\s*(.*)$", line)
+                if m and m.group(1) != "option":
+                    key, val = m.group(1), m.group(2).strip().strip("'\"")
+                    if key != "selected":
+                        it[key] = val
+                    in_opt = False
+    except Exception:
+        return {"current": None, "items": []}
+    return {"current": cur, "items": items}
+
+
+def _split_blocks(lines):
+    blocks, cur = [], None
+    for ln in lines:
+        if re.match(r"^- uid:\s*", ln):
+            if cur is not None:
+                blocks.append(cur)
+            cur = [ln]
+        elif cur is not None:
+            cur.append(ln)
+        else:
+            blocks.append([ln])
+    if cur is not None:
+        blocks.append(cur)
+    return blocks
+
+
+def _set_option(block, key, value):
+    """在块的 option 段设置键值；不存在则补在 option 段末尾。"""
+    try:
+        start = next(i for i, l in enumerate(block) if re.match(r"^\s*option:\s*$", l))
+    except StopIteration:
+        return False
+    end = start + 1
+    while end < len(block) and block[end].startswith("    ") and block[end].strip():
+        end += 1
+    seg = block[start + 1:end]
+    for i, l in enumerate(seg):
+        if re.match(r"^\s+" + key + r"\s*:", l):
+            seg[i] = f"    {key}: {value}"
+            block[start + 1:end] = seg
+            return True
+    seg.append(f"    {key}: {value}")
+    block[start + 1:end] = seg
+    return True
+
+
+def _copy_selected(blocks, uid):
+    for b in blocks:
+        if b and re.match(r"^- uid:\s*" + re.escape(uid) + r"\s*$", b[0]):
+            try:
+                s = next(i for i, l in enumerate(b) if re.match(r"^\s*selected:\s*$", l))
+            except StopIteration:
+                return []
+            e = s + 1
+            while e < len(b) and (b[e].startswith("  - ") or b[e].startswith("    ")):
+                e += 1
+            return b[s:e]
+    return []
+
+
+def harden_remote_profiles(log):
+    """关闭 remote 订阅的自动更新，并令其更新经 Clash 代理发出。"""
+    p = profiles_path()
+    if not p:
+        return False, "未找到 profiles.yaml", None
+    bak = p + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(p, bak)
+    log(f"已备份：{os.path.basename(bak)}")
+
+    with open(p, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    blocks = _split_blocks(lines)
+
+    touched = []
+    for b in blocks:
+        body = "\n".join(b)
+        if "type: remote" not in body:
+            continue
+        uid = re.match(r"^- uid:\s*(\S+)", b[0]).group(1)
+        _set_option(b, "with_proxy", "true")
+        _set_option(b, "allow_auto_update", "false")
+        _set_option(b, "update_interval", "0")
+        touched.append(uid)
+
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join("\n".join(b) for b in blocks).rstrip("\n") + "\n")
+    for t in touched:
+        log(f"已加固订阅：{t}")
+    msg = f"已处理 {len(touched)} 个远程订阅" if touched else "没有远程订阅"
+    return True, msg, {"t": "file", "path": p, "backup": bak, "created": False}
+
+
+def make_local_profile(log):
+    """从当前订阅内容生成本地副本并切换使用，彻底消除更新请求。"""
+    p = profiles_path()
+    if not p:
+        return False, "未找到 profiles.yaml", None
+    cfg = find_config_dir()
+    pdir = os.path.join(cfg, "profiles")
+
+    with open(p, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    blocks = _split_blocks(lines)
+
+    info = parse_profiles(p)
+    src_item = next((i for i in info["items"] if i["uid"] == info["current"]), None)
+    if not src_item:
+        return False, "未识别当前订阅", None
+    if src_item.get("type") == "local":
+        return False, "当前订阅已是本地副本，无需重复生成", None
+
+    src_file = src_item.get("file")
+    if not src_file:
+        return False, "当前订阅缺少文件名", None
+    src_path = os.path.join(pdir, src_file)
+    if not os.path.isfile(src_path):
+        return False, f"订阅文件不存在：{src_file}", None
+
+    uid = "Local" + src_item["uid"][:7]
+    new_file = src_item["uid"] + "-local.yaml"
+    bak = p + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(p, bak)
+    log(f"已备份：{os.path.basename(bak)}")
+
+    shutil.copy2(src_path, os.path.join(pdir, new_file))
+    log(f"已生成本地副本：{new_file}")
+
+    selected = _copy_selected(blocks, src_item["uid"])
+    item = [
+        f"- uid: {uid}",
+        "  type: local",
+        f"  name: {src_item.get('name', uid)} 本地副本",
+        f"  file: {new_file}",
+        "  desc: 由 Clash WiFi Kit 生成；本地文件，无网络请求",
+        f"  updated: {int(time.time())}",
+    ] + selected + [
+        "  option:",
+        "    with_proxy: true",
+        "    update_interval: 0",
+        "    allow_auto_update: false",
+    ]
+
+    blocks = [b for b in blocks if not (b and re.match(r"^- uid:\s*" + re.escape(uid) + r"\s*$", b[0]))]
+    blocks.append(item)
+    out = "\n".join("\n".join(b) for b in blocks)
+    out = re.sub(r"^current:.*$", f"current: {uid}", out, count=1, flags=re.M)
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(out.rstrip("\n") + "\n")
+    log(f"已切换当前订阅为：{uid}")
+    return True, f"已生成本地副本并切换：{uid}", {"t": "file", "path": p, "backup": bak, "created": False}
+
+
 # ================================================================== 界面
 class App(tk.Tk):
     """仪表盘 + 分步引导 + 回退，三种视图并存。"""
@@ -848,6 +1043,7 @@ class App(tk.Tk):
         self._tab_step3()
         self._tab_step4()
         self._tab_step5()
+        self._tab_subscription()
         self._tab_rollback()
         self._tab_about()
 
@@ -887,7 +1083,7 @@ class App(tk.Tk):
         lf1 = ttk.LabelFrame(mid, text=" 网卡与默认路由 ")
         lf1.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         cols = ("idx", "name", "state", "metric", "ip", "route")
-        self.tv_ad = ttk.Treeview(lf1, columns=cols, show="headings", height=6)
+        self.tv_ad = ttk.Treeview(lf1, columns=cols, show="headings", height=8)
         for c, t, wd in zip(cols, ("索引", "网卡", "状态", "metric", "IPv4", "默认路由"),
                             (46, 132, 62, 62, 120, 108)):
             self.tv_ad.heading(c, text=t)
@@ -899,7 +1095,7 @@ class App(tk.Tk):
         lf2 = ttk.LabelFrame(mid, text=" 检查清单（路由与绑定是否设置成功） ")
         lf2.grid(row=0, column=1, sticky="nsew")
         cols2 = ("s", "item", "detail")
-        self.tv_ck = ttk.Treeview(lf2, columns=cols2, show="headings", height=6)
+        self.tv_ck = ttk.Treeview(lf2, columns=cols2, show="headings", height=8)
         self.tv_ck.heading("s", text="")
         self.tv_ck.heading("item", text="检查项")
         self.tv_ck.heading("detail", text="说明")
@@ -940,7 +1136,7 @@ class App(tk.Tk):
         bar.pack(side="bottom", fill="x", pady=(8, 4), before=mid)
 
     # ------------------------------------------------ 分步页
-    def _doc(self, parent, headline, why, steps, ok):
+    def _doc(self, parent, headline, why, steps, ok, maxh=20):
         ttk.Label(parent, text=headline, style="Title.TLabel").pack(anchor="w", pady=(12, 4))
         box = tk.Frame(parent, bg=C_CARD, highlightthickness=1, highlightbackground="#d6dbe2")
         box.pack(fill="x", pady=(2, 0))
@@ -961,7 +1157,7 @@ class App(tk.Tk):
         est = 0
         for seg in "\n\n".join(body).split("\n"):
             est += max(1, -(-len(seg) // 78))
-        txt.configure(height=max(6, min(est + 2, 20)))
+        txt.configure(height=max(6, min(est + 2, maxh)))
 
     def _btns(self, parent, items):
         bar = ttk.Frame(parent)
@@ -1064,6 +1260,143 @@ class App(tk.Tk):
         self.act_task_status()
 
         self._outbox(f, "wd", 8)
+
+    # ---------------- 订阅加固
+    def procs_running(self):
+        try:
+            return len(clash_procs()) > 0
+        except Exception:
+            return False
+
+    def _tab_subscription(self):
+        f = self._page("订阅加固")
+        self._doc(f, "消除订阅更新导致的直连",
+                  "订阅更新是客户端唯一会绕过代理、直连上游的路径。若更新走默认路由，"
+                  "域名解析与 TLS SNI 就会出现在物理出口的日志里。"
+                  "本页关闭自动更新、令更新经代理发出，并可生成本地副本彻底消除该请求。",
+                  ["点击「重新扫描」查看当前订阅状态与风险项。",
+                   "点击「关闭自动更新并启用代理」，处理全部远程订阅。",
+                   "点击「生成本地副本并切换」，把当前订阅转为本地文件，不再有任何请求。",
+                   "修改后必须重启 Clash Verge 才会生效。"],
+                  "远程订阅显示「自动更新 否 / 走代理 是」；当前订阅为本地副本。", 9)
+
+        self._btns(f, [("重新扫描", self.act_sub_scan),
+                       ("关闭自动更新并启用代理", self.act_sub_harden),
+                       ("生成本地副本并切换", self.act_sub_localize),
+                       ("打开配置目录", self.act_open_cfg)])
+
+        self.lb_sub = ttk.Label(f, text="", style="Sub.TLabel")
+        self.lb_sub.pack(anchor="w", pady=(8, 2))
+
+        fr = ttk.LabelFrame(f, text=" 订阅列表 ")
+        fr.pack(fill="both", expand=True, pady=(2, 0))
+        cols = ("name", "type", "auto", "interval", "proxy", "risk")
+        self.tv_sub = ttk.Treeview(fr, columns=cols, show="headings", height=8)
+        for c, t, wdt in zip(cols, ("名称", "类型", "自动更新", "间隔", "走代理", "风险"),
+                             (270, 80, 90, 70, 80, 170)):
+            self.tv_sub.heading(c, text=t)
+            self.tv_sub.column(c, width=wdt, anchor="w")
+        sb = ttk.Scrollbar(fr, command=self.tv_sub.yview)
+        self.tv_sub.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tv_sub.pack(fill="both", expand=True, padx=5, pady=5)
+        self.tv_sub.tag_configure("bad", foreground=C_BAD)
+        self.tv_sub.tag_configure("ok", foreground=C_OK)
+
+        self.act_sub_scan()
+
+    def act_sub_scan(self):
+        p = profiles_path()
+        if not p:
+            if hasattr(self, "lb_sub"):
+                self.lb_sub.configure(text="未找到 profiles.yaml，请确认 Clash Verge 已安装",
+                                      foreground=C_BAD)
+            return
+        info = parse_profiles(p)
+        for i in self.tv_sub.get_children():
+            self.tv_sub.delete(i)
+
+        yn = {"true": "是", "false": "否"}
+        risky, lines = 0, []
+        for it in info["items"]:
+            t = it.get("type", "")
+            if t not in ("remote", "local"):
+                continue
+            o = it.get("option", {})
+            auto = str(o.get("allow_auto_update", "true")).lower()
+            proxy = str(o.get("with_proxy", "false")).lower()
+            interval = str(o.get("update_interval", "?"))
+            bad = (t == "remote") and (auto != "false" or proxy != "true")
+            if bad:
+                risky += 1
+            name = it.get("name") or it.get("uid")
+            self.tv_sub.insert("", "end", tags=("bad" if bad else "ok",),
+                               values=(name, t, yn.get(auto, auto), interval,
+                                       yn.get(proxy, proxy), "直连风险" if bad else "—"))
+            lines.append(f"{name}\t{t}\t自动={auto}\t间隔={interval}\t走代理={proxy}")
+
+        cur = info.get("current")
+        cur_item = next((i for i in info["items"] if i["uid"] == cur), None)
+        kind = "本地副本" if cur_item and cur_item.get("type") == "local" else "远程订阅"
+        tail = "　（Clash Verge 运行中，修改需重启生效）" if self.procs_running() else ""
+        self.lb_sub.configure(
+            text=f"当前订阅：{cur}（{kind}）　风险项：{risky} 个{tail}",
+            foreground=(C_BAD if risky else C_OK))
+
+    def act_sub_harden(self):
+        if not profiles_path():
+            messagebox.showerror(APP_NAME, "未找到 profiles.yaml")
+            return
+        if self.procs_running() and not messagebox.askyesno(
+                APP_NAME,
+                "检测到 Clash Verge 正在运行。\n\n"
+                "程序退出时可能覆盖本次修改，建议先退出 Clash Verge。\n\n仍要继续？"):
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                "将关闭全部远程订阅的自动更新，并令其更新经 Clash 代理发出。\n\n"
+                "修改前自动备份，可在「回退与还原」页撤销。确认继续？"):
+            return
+
+        def job():
+            ok, msg, undo = harden_remote_profiles(lambda s: self.q.put(("log", s)))
+            if ok:
+                if undo:
+                    record("订阅加固", msg, undo)
+                self.q.put(("msg", msg + "\n\n请重启 Clash Verge 使配置生效。"))
+                self.q.put(("hist", None))
+                self.q.put(("subscan", None))
+            else:
+                self.q.put(("err", msg))
+        self._bg(job)
+
+    def act_sub_localize(self):
+        if not profiles_path():
+            messagebox.showerror(APP_NAME, "未找到 profiles.yaml")
+            return
+        if self.procs_running() and not messagebox.askyesno(
+                APP_NAME,
+                "检测到 Clash Verge 正在运行。\n\n"
+                "程序退出时可能覆盖本次修改，建议先退出 Clash Verge。\n\n仍要继续？"):
+            return
+        if not messagebox.askyesno(
+                APP_NAME,
+                "将把当前订阅内容复制为本地文件，并切换使用该本地副本。\n\n"
+                "此后不再有任何订阅更新请求。原远程订阅保留，可随时切回。\n"
+                "修改前自动备份，可在「回退与还原」页撤销。确认继续？"):
+            return
+
+        def job():
+            ok, msg, undo = make_local_profile(lambda s: self.q.put(("log", s)))
+            if ok:
+                if undo:
+                    record("生成本地订阅副本", msg, undo)
+                self.q.put(("msg", msg + "\n\n请重启 Clash Verge 使配置生效。"))
+                self.q.put(("hist", None))
+                self.q.put(("subscan", None))
+            else:
+                self.q.put(("err", msg))
+        self._bg(job)
 
     def _tab_rollback(self):
         f = self._page("回退与还原")
@@ -1169,6 +1502,8 @@ class App(tk.Tk):
                     self.act_hist_refresh()
                 elif kind == "task":
                     self.act_task_status()
+                elif kind == "subscan":
+                    self.act_sub_scan()
         except queue.Empty:
             pass
         self.after(100, self._pump)

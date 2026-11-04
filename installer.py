@@ -18,7 +18,7 @@ import sys
 import winreg
 
 APP_NAME = "Clash WiFi Kit"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 FOLDER = "ClashWiFiKit"
 KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ClashWiFiKit"
 
